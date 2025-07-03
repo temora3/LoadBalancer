@@ -6,21 +6,20 @@ import random
 import string
 import threading
 import time
-import json
+import hashlib
 from consistent_hash import ConsistentHash
 
 app = Flask(__name__)
+
 
 class LoadBalancer:
     def __init__(self):
         self.consistent_hash = ConsistentHash()
         self.servers = {}  # server_id -> container_name mapping
-        self.network_name = "load-balancer-project_net1"  # Docker compose network name
-        self.server_image = "load-balancer-project_server-build:latest"
+        self.network_name = "net1"
+        self.server_image = "server:latest"
         self.lock = threading.Lock()
-        
-        # Wait a bit for Docker network to be ready
-        time.sleep(5)
+        self.request_counter = 0  # Add request counter for better distribution
         
         # Initialize with 3 default servers
         self._initialize_servers()
@@ -36,25 +35,17 @@ class LoadBalancer:
     
     def _initialize_servers(self):
         """Initialize with 3 default servers"""
-        print("Initializing default servers...")
         for i in range(1, 4):
             server_name = f"Server_{i}"
             if self._spawn_server(server_name):
                 self.servers[server_name] = server_name
                 self.consistent_hash.add_server(server_name)
-                print(f"Successfully started {server_name}")
-            else:
-                print(f"Failed to start {server_name}")
     
     def _spawn_server(self, server_name):
         """Spawn a new server container"""
         try:
-            # Remove existing container with same name if it exists
-            subprocess.run(['docker', 'rm', '-f', server_name], 
-                         capture_output=True, text=True)
-            
             cmd = [
-                'docker', 'run',
+                'sudo', 'docker', 'run',
                 '--name', server_name,
                 '--network', self.network_name,
                 '--network-alias', server_name,
@@ -64,21 +55,17 @@ class LoadBalancer:
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                # Wait a moment for container to start
-                time.sleep(2)
-                return True
-            else:
-                print(f"Error spawning {server_name}: {result.stderr}")
-                return False
+            return result.returncode == 0
         except Exception as e:
-            print(f"Exception spawning server {server_name}: {e}")
+            print(f"Error spawning server {server_name}: {e}")
             return False
     
     def _remove_server_container(self, server_name):
         """Remove a server container"""
         try:
-            subprocess.run(['docker', 'rm', '-f', server_name], 
+            subprocess.run(['sudo', 'docker', 'stop', server_name], 
+                         capture_output=True, text=True)
+            subprocess.run(['sudo', 'docker', 'rm', server_name], 
                          capture_output=True, text=True)
             return True
         except Exception as e:
@@ -101,8 +88,7 @@ class LoadBalancer:
                     response = requests.get(f'http://{server_name}:5000/heartbeat', timeout=5)
                     if response.status_code != 200:
                         failed_servers.append(server_name)
-                except Exception as e:
-                    print(f"Health check failed for {server_name}: {e}")
+                except:
                     failed_servers.append(server_name)
             
             # Replace failed servers
@@ -110,8 +96,7 @@ class LoadBalancer:
                 print(f"Server {server_name} failed, replacing...")
                 self._remove_server_container(server_name)
                 self.consistent_hash.remove_server(server_name)
-                if server_name in self.servers:
-                    del self.servers[server_name]
+                del self.servers[server_name]
                 
                 # Spawn replacement
                 new_name = self._generate_random_name()
@@ -119,20 +104,22 @@ class LoadBalancer:
                     self.servers[new_name] = new_name
                     self.consistent_hash.add_server(new_name)
                     print(f"Replaced with {new_name}")
+    
+    def _generate_request_id(self):
+        """Generate a unique request ID for better distribution"""
+        with self.lock:
+            self.request_counter += 1
+            # Combine counter with timestamp and random component for uniqueness
+            timestamp = int(time.time() * 1000000)  # microseconds
+            random_part = random.randint(1000, 9999)
+            return f"{self.request_counter}_{timestamp}_{random_part}"
 
 # Global load balancer instance
-lb = None
+lb = LoadBalancer()
 
-def initialize_lb():
-    global lb
-    if lb is None:
-        lb = LoadBalancer()
-
+# API endpoints for the load balancer
 @app.route('/rep', methods=['GET'])
 def get_replicas():
-    if lb is None:
-        initialize_lb()
-    
     with lb.lock:
         return jsonify({
             "message": {
@@ -144,9 +131,6 @@ def get_replicas():
 
 @app.route('/add', methods=['POST'])
 def add_servers():
-    if lb is None:
-        initialize_lb()
-        
     data = request.get_json()
     
     if not data or 'n' not in data:
@@ -165,6 +149,8 @@ def add_servers():
         }), 400
     
     with lb.lock:
+        new_servers = []
+        
         # Use provided hostnames or generate random ones
         for i in range(n):
             if i < len(hostnames):
@@ -175,6 +161,7 @@ def add_servers():
             if lb._spawn_server(server_name):
                 lb.servers[server_name] = server_name
                 lb.consistent_hash.add_server(server_name)
+                new_servers.append(server_name)
         
         return jsonify({
             "message": {
@@ -186,9 +173,6 @@ def add_servers():
 
 @app.route('/rm', methods=['DELETE'])
 def remove_servers():
-    if lb is None:
-        initialize_lb()
-        
     data = request.get_json()
     
     if not data or 'n' not in data:
@@ -211,10 +195,10 @@ def remove_servers():
         
         # Select servers to remove
         if hostnames:
-            servers_to_remove.extend([h for h in hostnames if h in lb.servers])
-            remaining = n - len(servers_to_remove)
+            servers_to_remove.extend(hostnames)
+            remaining = n - len(hostnames)
             if remaining > 0:
-                available = [s for s in lb.servers.keys() if s not in servers_to_remove]
+                available = [s for s in lb.servers.keys() if s not in hostnames]
                 servers_to_remove.extend(random.sample(available, min(remaining, len(available))))
         else:
             servers_to_remove = random.sample(list(lb.servers.keys()), min(n, len(lb.servers)))
@@ -234,13 +218,11 @@ def remove_servers():
             "status": "successful"
         }), 200
 
+# Route all requests to the appropriate server based on consistent hashing
 @app.route('/<path:path>', methods=['GET'])
 def route_request(path):
-    if lb is None:
-        initialize_lb()
-        
-    # Generate request ID (you can make this more sophisticated)
-    request_id = random.randint(100000, 999999)
+    # Generate unique request ID for better distribution
+    request_id = lb._generate_request_id()
     
     with lb.lock:
         server = lb.consistent_hash.get_server(request_id)
@@ -258,8 +240,7 @@ def route_request(path):
                 status=response.status_code,
                 headers=dict(response.headers)
             )
-        except Exception as e:
-            print(f"Error routing to {server}: {e}")
+        except:
             return jsonify({
                 "message": f"<Error> '/{path}' endpoint does not exist in server replicas",
                 "status": "failure"
